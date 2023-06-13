@@ -376,9 +376,9 @@ def test_mbar_compute_entropy_and_enthalpy(mbar_and_test, with_uxx=True):
     s_ij = results["Delta_s"]
     ds_ij = results["dDelta_s"]
 
-    fa = test.analytical_free_energies()
-    ua = test.analytical_observable("potential energy")
-    sa = test.analytical_entropies()
+    fa = test.analytical_free_energies().astype(dtype=mbar._bits.npfloat)
+    ua = test.analytical_observable("potential energy").astype(dtype=mbar._bits.npfloat)
+    sa = test.analytical_entropies().astype(dtype=mbar._bits.npfloat)
 
     fa_ij = fa - fa.T
     ua_ij = ua - ua.T

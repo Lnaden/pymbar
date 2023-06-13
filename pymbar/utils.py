@@ -38,6 +38,48 @@ class TypeCastPerformanceWarning(RuntimeWarning):
     pass
 
 
+class BitSizeTracker:
+    """
+    Helper class for setting bit-size consistently
+    """
+    DEFAULT_BITS = 32
+
+    def __init__(self, bits=None):
+        if bits is None:
+            bits = BitSizeTracker.DEFAULT_BITS
+        elif isinstance(bits, str):
+            # Try stripping out things like "x64-bits" and just get the number
+            bits.strip("x-bits")
+        elif isinstance(bits, BitSizeTracker):
+            bits = bits.bitsize
+        # Cast to ints
+        try:
+            bits = int(bits)
+        except ValueError:
+            raise ValueError(f"Could not convert {bits} to some kind of integer for bitsize "
+                             f"representation. Please use either a power of 2 int or string like 'x64'")
+        # Use bit-operators to check for power of 2, limit to 64 bit precision
+        if not ((bits & (bits-1) == 0) and bits != 0) or bits > 64:
+            raise ValueError(f"MBAR only supports bitsizes in power of 2's up to 64-bits. "
+                             f"Cannot support {bits}-bit")
+        self._b = bits
+
+    def _np_type_x(self, number_type):
+        return getattr(np, f"{number_type}{self._b}")
+
+    @property
+    def npint(self):
+        return self._np_type_x("int")
+
+    @property
+    def npfloat(self):
+        return self._np_type_x("float")
+
+    @property
+    def bitsize(self):
+        return self._b
+
+
 def kln_to_kn(kln, N_k=None, cleanup=False):
     """Convert KxKxN_max array to KxN max array
 

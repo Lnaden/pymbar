@@ -1,11 +1,14 @@
 import logging
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 
 # Optimize imported here and below as the jax-optimized one is jax or passthrough, but this is required regardless
 import scipy.optimize
-from pymbar.utils import ensure_type, check_w_normalized, ParameterError
+from pymbar.utils import ensure_type, check_w_normalized, ParameterError, BitSizeTracker
+
+logger = logging.getLogger(__name__)
 
 use_jit = False
 force_no_jax = False  # Temporary until we can make a proper setting to enable/disable by choice
@@ -17,7 +20,7 @@ try:
     try:
         from jax.config import config
 
-        config.update("jax_enable_x64", True)
+        # config.update("jax_enable_x64", True)
 
         from jax.numpy import exp, sum, newaxis, diag, dot, s_
         from jax.numpy import pad as npad
@@ -30,7 +33,7 @@ try:
         use_jit = True
     except ImportError:
         # Catch no JAX and throw a warning
-        warnings.warn(
+        logger.warn(
             "\n"
             "********* JAX NOT FOUND *********\n"
             " PyMBAR can run faster with JAX  \n"
@@ -61,7 +64,6 @@ except ImportError:
 # Known issue with astroid<2.12 and numpy array returns, but 2.12 doesn't fix it due to returns being jax.
 # Can be mostly ignored
 
-logger = logging.getLogger(__name__)
 
 if use_jit is False:
     logger.info("JAX was either not detected or disabled, using standard NumPy and SciPy")
@@ -109,6 +111,63 @@ scipy_nohess_options = [
 ]  # don't pass a hessian to these to avoid warnings to these.
 scipy_root_options = ["hybr", "lm"]  # only use root options with the hessian included
 
+default_bits = BitSizeTracker()  # Track the default bit-size tracker
+update_bits = True  #
+
+
+@contextmanager
+def disable_jax_bit_checking():
+    """
+    Disable checking for JAX bit size for nested functions
+
+    Parameters
+    ----------
+    bits: BitSizeTracker
+        Bitsize setting to check.
+    """
+    global update_bits
+    update_bits = False
+    yield
+    update_bits = True
+
+
+def attempt_set_jax_precision(bits=default_bits):
+    """
+    Attempt to set JAX precision if present. This does nothing if jax is not present
+
+    Reads the global "update_bits" variable and will not try to set bits if set
+
+    Parameters
+    ----------
+    bits: BitSizeTracker
+        Bitsize setting to check.
+    """
+    if use_jit and update_bits:
+        # This will only trigger if JAX is set
+        # Determine jax bits
+        jax_bits = 64 if config.x64_enabled else 32
+        # Set the toggle
+        jax_config_bool = {64: True,
+                           32: False
+                           }
+        # Conditions:
+        # Jax bits are the same or less than JAX possible
+        if bits.bitsize < 32 or bits.bitsize == jax_bits:
+            pass
+        # Jax bits are changing
+        else:
+            logger.warning(f"**** JAX Bitsize is changing! ****\n"
+                           f"Current JAX bitsize is: {jax_bits}\n"
+                           f"Bitsize will be set to: {bits.bitsize}\n"
+                           f"This may cause issues if you are using JAX elsewhere as "
+                           f"JAX operates in 32-bit mode by default.\n"
+                           f"OR\n"
+                           f"If you have already run this code once, changing the bitsize does not change the "
+                           f"JIT functions!\n"
+                           f"***********************************\n"
+                           )
+            config.update("jax_enable_x64", jax_config_bool[bits.bitsize])
+
 
 def validate_inputs(u_kn, N_k, f_k):
     """Check types and return inputs for MBAR calculations.
@@ -142,7 +201,27 @@ def validate_inputs(u_kn, N_k, f_k):
     return u_kn, N_k, f_k
 
 
-def self_consistent_update(u_kn, N_k, f_k, states_with_samples=None):
+def jited_call_attempt_bits(fn, *args, bits=default_bits):
+    """
+    Helper function to attempt to set the bitsize for JAX and then call the function in question
+
+    Parameters
+    ----------
+    fn : Callable object
+        JIT'ed function to call
+    args : tuple
+        Set of arguments to pass to the function
+    bits : int, BitSizeTracker, or str; optional
+        Bitsize to set JAX and all arrays to
+
+    Returns whatever the fn will return
+    """
+
+    attempt_set_jax_precision(bits)
+    return fn(*args)
+
+
+def self_consistent_update(u_kn, N_k, f_k, states_with_samples=None, bits=default_bits):
     """Return an improved guess for the dimensionless free energies
 
     Parameters
@@ -164,7 +243,7 @@ def self_consistent_update(u_kn, N_k, f_k, states_with_samples=None):
     Equation C3 in MBAR JCP paper.
     """
 
-    return jax_self_consistent_update(u_kn, N_k, f_k, states_with_samples=states_with_samples)
+    return jax_self_consistent_update(u_kn, N_k, f_k, states_with_samples=states_with_samples, bits=bits)
 
 
 @jit_or_passthrough
@@ -181,7 +260,7 @@ def _jit_self_consistent_update(u_kn, N_k, f_k):
     )  # pylint: disable=invalid-unary-operand-type
 
 
-def jax_self_consistent_update(u_kn, N_k, f_k, states_with_samples=None):
+def jax_self_consistent_update(u_kn, N_k, f_k, states_with_samples=None, bits=default_bits):
     """JAX version of self_consistent update.  For parameters, see self_consistent_update.
     N_k must be float (should be cast at a higher level)
 
@@ -191,12 +270,15 @@ def jax_self_consistent_update(u_kn, N_k, f_k, states_with_samples=None):
     # In theory, this can be computed with jax.lax.cond, but trying to reuse code for non-jax paths
     states_with_samples = s_[:] if states_with_samples is None else states_with_samples
     # Feed to the JIT'd function. Can't pass slice types, so slice here
-    return _jit_self_consistent_update(
-        u_kn[states_with_samples], N_k[states_with_samples], f_k[states_with_samples]
-    )
+    return jited_call_attempt_bits(_jit_self_consistent_update,
+                                   u_kn[states_with_samples], N_k[states_with_samples], f_k[states_with_samples],
+                                   bits=bits)
+    # return _jit_self_consistent_update(
+    #     u_kn[states_with_samples], N_k[states_with_samples], f_k[states_with_samples]
+    # )
 
 
-def mbar_gradient(u_kn, N_k, f_k):
+def mbar_gradient(u_kn, N_k, f_k, bits=default_bits):
     """Gradient of MBAR objective function.
 
     Parameters
@@ -207,6 +289,8 @@ def mbar_gradient(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -217,7 +301,7 @@ def mbar_gradient(u_kn, N_k, f_k):
     -----
     This is equation C6 in the JCP MBAR paper.
     """
-    return jax_mbar_gradient(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_gradient, u_kn, N_k, f_k, bits=bits)
 
 
 @jit_or_passthrough
@@ -231,7 +315,7 @@ def jax_mbar_gradient(u_kn, N_k, f_k):
     return -1 * N_k * (1.0 - exp(f_k + log_numerator_k))
 
 
-def mbar_objective(u_kn, N_k, f_k):
+def mbar_objective(u_kn, N_k, f_k, bits=default_bits):
     """Calculates objective function for MBAR.
 
     Parameters
@@ -242,6 +326,8 @@ def mbar_objective(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
 
     Returns
@@ -260,7 +346,7 @@ def mbar_objective(u_kn, N_k, f_k):
     outermost sum and logsumexp for the inner sum.
     """
 
-    return jax_mbar_objective(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_objective, u_kn, N_k, f_k, bits=bits)
 
 
 @jit_or_passthrough
@@ -294,7 +380,7 @@ def jax_mbar_objective_and_gradient(u_kn, N_k, f_k):
     return obj, grad
 
 
-def mbar_objective_and_gradient(u_kn, N_k, f_k):
+def mbar_objective_and_gradient(u_kn, N_k, f_k, bits=default_bits):
     """Calculates both objective function and gradient for MBAR.
 
     Parameters
@@ -305,7 +391,8 @@ def mbar_objective_and_gradient(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
-
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -328,7 +415,7 @@ def mbar_objective_and_gradient(u_kn, N_k, f_k):
     function is its integral.
     """
 
-    return jax_mbar_objective_and_gradient(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_objective_and_gradient, u_kn, N_k, f_k, bits=bits)
 
 
 @jit_or_passthrough
@@ -350,7 +437,7 @@ def jax_mbar_hessian(u_kn, N_k, f_k):
     return -1.0 * H
 
 
-def mbar_hessian(u_kn, N_k, f_k):
+def mbar_hessian(u_kn, N_k, f_k, bits=default_bits):
     """Hessian of MBAR objective function.
 
     Parameters
@@ -361,6 +448,8 @@ def mbar_hessian(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -372,7 +461,7 @@ def mbar_hessian(u_kn, N_k, f_k):
     Equation (C9) in JCP MBAR paper.
     """
 
-    return jax_mbar_hessian(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_hessian, u_kn, N_k, f_k, bits=bits)
 
 
 @jit_or_passthrough
@@ -388,7 +477,7 @@ def jax_mbar_log_W_nk(u_kn, N_k, f_k):
     return logW
 
 
-def mbar_log_W_nk(u_kn, N_k, f_k):
+def mbar_log_W_nk(u_kn, N_k, f_k, bits=default_bits):
     """Calculate the log weight matrix.
 
     Parameters
@@ -399,6 +488,8 @@ def mbar_log_W_nk(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -409,7 +500,7 @@ def mbar_log_W_nk(u_kn, N_k, f_k):
     -----
     Equation (9) in JCP MBAR paper.
     """
-    return jax_mbar_log_W_nk(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_log_W_nk, u_kn, N_k, f_k, bits=bits)
 
 
 @jit_or_passthrough
@@ -422,7 +513,7 @@ def jax_mbar_W_nk(u_kn, N_k, f_k):
     return exp(jax_mbar_log_W_nk(u_kn, N_k, f_k))
 
 
-def mbar_W_nk(u_kn, N_k, f_k):
+def mbar_W_nk(u_kn, N_k, f_k, bits=default_bits):
     """Calculate the weight matrix.
 
     Parameters
@@ -433,6 +524,8 @@ def mbar_W_nk(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -443,10 +536,10 @@ def mbar_W_nk(u_kn, N_k, f_k):
     -----
     Equation (9) in JCP MBAR paper.
     """
-    return jax_mbar_W_nk(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_mbar_W_nk, u_kn, N_k, f_k, bits=bits)
 
 
-def adaptive(u_kn, N_k, f_k, tol=1.0e-8, options=None):
+def adaptive(u_kn, N_k, f_k, tol=1.0e-8, options=None, bits=default_bits):
     """
     Determine dimensionless free energies by a combination of Newton-Raphson iteration and self-consistent iteration.
     Picks whichever method gives the lowest gradient.
@@ -459,6 +552,9 @@ def adaptive(u_kn, N_k, f_k, tol=1.0e-8, options=None):
         gamma (float between 0 and 1) - incrementor for NR iterations (default 1.0).  Usually not changed now, since adaptively switch.
         maxiter (int) - maximum number of Newton-Raphson iterations (default 10000: either NR converges or doesn't, pretty quickly)
         verbose (boolean) - verbosity level for debug output
+
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     NOTES
 
@@ -502,101 +598,108 @@ def adaptive(u_kn, N_k, f_k, tol=1.0e-8, options=None):
     f_sci = np.zeros(len(f_k), dtype=np.float64)
     f_nr = np.zeros(len(f_k), dtype=np.float64)
 
+    attempt_set_jax_precision(bits=bits)
+
     # Perform Newton-Raphson iterations (with sci computed on the way)
 
     # usually calculated at the end of the loop and saved, but we need
     # to calculate the first time.
-    g = mbar_gradient(u_kn, N_k, f_k)  # Objective function gradient.
+    with disable_jax_bit_checking():
+        g = mbar_gradient(u_kn, N_k, f_k)  # Objective function gradient.
 
-    maxiter = options["maxiter"]
-    min_sc_iter = options["min_sc_iter"]
-    warn = "Did not converge."
-    for iteration in range(0, maxiter):
-        if use_jit:
-            (f_sci, g_sci, gnorm_sci, f_nr, g_nr, gnorm_nr) = jax_core_adaptive(
-                u_kn, N_k, f_k, options["gamma"]
-            )
-        else:
-            H = mbar_hessian(u_kn, N_k, f_k)  # Objective function hessian
-            Hinvg = np.linalg.lstsq(H, g, rcond=-1)[0]
-            Hinvg -= Hinvg[0]
-            f_nr = f_k - gamma * Hinvg
+        maxiter = options["maxiter"]
+        min_sc_iter = options["min_sc_iter"]
+        warn = "Did not converge."
+        attempt_set_jax_precision(bits=bits)  # Attempt to set the JAX bits before we use it
+        for iteration in range(0, maxiter):
+            if use_jit:
+                (f_sci, g_sci, gnorm_sci, f_nr, g_nr, gnorm_nr) = jax_core_adaptive(
+                    u_kn, N_k, f_k, options["gamma"]
+                )
+            else:
+                H = mbar_hessian(u_kn, N_k, f_k)  # Objective function hessian
+                Hinvg = np.linalg.lstsq(H, g, rcond=-1)[0]
+                Hinvg -= Hinvg[0]
+                f_nr = f_k - gamma * Hinvg
 
-            # self-consistent iteration gradient norm and saved log sums.
-            f_sci = self_consistent_update(u_kn, N_k, f_k)
-            f_sci = f_sci - f_sci[0]  # zero out the minimum
-            g_sci = mbar_gradient(u_kn, N_k, f_sci)
-            gnorm_sci = dot(g_sci, g_sci)
+                # self-consistent iteration gradient norm and saved log sums.
+                f_sci = self_consistent_update(u_kn, N_k, f_k)
+                f_sci = f_sci - f_sci[0]  # zero out the minimum
+                g_sci = mbar_gradient(u_kn, N_k, f_sci)
+                gnorm_sci = dot(g_sci, g_sci)
 
-            # newton raphson gradient norm and saved log sums.
-            g_nr = mbar_gradient(u_kn, N_k, f_nr)
-            gnorm_nr = dot(g_nr, g_nr)
+                # newton raphson gradient norm and saved log sums.
+                g_nr = mbar_gradient(u_kn, N_k, f_nr)
+                gnorm_nr = dot(g_nr, g_nr)
 
-        # we could save the gradient, for the next round, but it's not too expensive to
-        # compute since we are doing the Hessian anyway.
+            # we could save the gradient, for the next round, but it's not too expensive to
+            # compute since we are doing the Hessian anyway.
 
-        if options["verbose"]:
-            logger.info(
-                "self consistent iteration gradient norm is %10.5g, Newton-Raphson gradient norm is %10.5g"
-                % (np.sqrt(gnorm_sci), np.sqrt(gnorm_nr))
-            )
-        # decide which directon to go depending on size of gradient norm
-        f_old = f_k
-
-        if gnorm_sci < gnorm_nr or sci_iter < min_sc_iter:
-            f_k = f_sci
-            g = g_sci
-            sci_iter += 1
             if options["verbose"]:
-                if sci_iter < min_sc_iter:
-                    logger.info(
-                        f"Choosing self-consistent iteration on iteration {iteration:d} because min_sci_iter={min_sc_iter:d}"
-                    )
-                else:
-                    logger.info(
-                        f"Choosing self-consistent iteration for lower gradient on iteration {iteration:d}"
-                    )
-        else:
-            f_k = f_nr
-            g = g_nr
-            nr_iter += 1
+                logger.info(
+                    "self consistent iteration gradient norm is %10.5g, Newton-Raphson gradient norm is %10.5g"
+                    % (np.sqrt(gnorm_sci), np.sqrt(gnorm_nr))
+                )
+            # decide which directon to go depending on size of gradient norm
+            f_old = f_k
+
+            if gnorm_sci < gnorm_nr or sci_iter < min_sc_iter:
+                f_k = f_sci
+                g = g_sci
+                sci_iter += 1
+                if options["verbose"]:
+                    if sci_iter < min_sc_iter:
+                        logger.info(
+                            f"Choosing self-consistent iteration on iteration {iteration:d} because "
+                            f"min_sci_iter={min_sc_iter:d}"
+                        )
+                    else:
+                        logger.info(
+                            f"Choosing self-consistent iteration for lower gradient on iteration {iteration:d}"
+                        )
+            else:
+                f_k = f_nr
+                g = g_nr
+                nr_iter += 1
+                if options["verbose"]:
+                    logger.info(f"Newton-Raphson used on iteration {iteration:}")
+
+            div = np.abs(f_k[1:])  # what we will divide by to get relative difference
+            zeroed = np.abs(f_k[1:]) < np.min(
+                [10**-8, tol]
+            )  # check which values are near enough to zero, hard coded max for now.
+            div[zeroed] = 1.0  # for these values, use absolute values.
+            max_delta = np.max(np.abs(f_k[1:] - f_old[1:]) / div)
+            max_diff = np.max(np.abs(f_sci[1:] - f_nr[1:]) / div)
+            # add this just to make sure they are not too different.
+            # if we start with bad states, the f_k - f_k_old might be far off.
+            if np.isnan(max_delta) or ((max_delta < tol) and max_diff < np.sqrt(tol)):
+                doneIterating = True
+                success = True
+                warn = "Convergence achieved by change in f with respect to previous guess."
+                break
+
+        if doneIterating:
             if options["verbose"]:
-                logger.info(f"Newton-Raphson used on iteration {iteration:}")
-
-        div = np.abs(f_k[1:])  # what we will divide by to get relative difference
-        zeroed = np.abs(f_k[1:]) < np.min(
-            [10**-8, tol]
-        )  # check which values are near enough to zero, hard coded max for now.
-        div[zeroed] = 1.0  # for these values, use absolute values.
-        max_delta = np.max(np.abs(f_k[1:] - f_old[1:]) / div)
-        max_diff = np.max(np.abs(f_sci[1:] - f_nr[1:]) / div)
-        # add this just to make sure they are not too different.
-        # if we start with bad states, the f_k - f_k_old might be far off.
-        if np.isnan(max_delta) or ((max_delta < tol) and max_diff < np.sqrt(tol)):
-            doneIterating = True
-            success = True
-            warn = "Convergence achieved by change in f with respect to previous guess."
-            break
-
-    if doneIterating:
-        if options["verbose"]:
-            logger.info(f"Converged to tolerance of {max_delta:e} in {iteration+1:d} iterations.")
-            logger.info(
-                f"Of {iteration+1:d} iterations, {nr_iter:d} were Newton-Raphson iterations and {sci_iter:d} were self-consistent iterations"
-            )
-            if np.all(f_k == 0.0):
-                logger.info("WARNING: All f_k appear to be zero.")
-    else:
-        logger.warning("WARNING: Did not converge to within specified tolerance.")
-
-        if maxiter <= 0:
-            logger.warning(
-                f"No iterations ran be cause maximum_iterations was <= 0 ({maxiter:s})!"
-            )
+                logger.info(f"Converged to tolerance of {max_delta:e} in {iteration+1:d} iterations.")
+                logger.info(
+                    f"Of {iteration+1:d} iterations, {nr_iter:d} were Newton-Raphson iterations and {sci_iter:d} were "
+                    f"self-consistent iterations"
+                )
+                if np.all(f_k == 0.0):
+                    logger.info("WARNING: All f_k appear to be zero.")
         else:
-            logger.warning(
-                f"max_delta = {max_delta:e}, tol = {tol:e}, maximum_iterations = {maxiter:d}, iterations completed = {iteration:d}"
-            )
+            logger.warning("WARNING: Did not converge to within specified tolerance.")
+
+            if maxiter <= 0:
+                logger.warning(
+                    f"No iterations ran be cause maximum_iterations was <= 0 ({maxiter:s})!"
+                )
+            else:
+                logger.warning(
+                    f"max_delta = {max_delta:e}, tol = {tol:e}, maximum_iterations = {maxiter:d}, iterations completed "
+                    f"= {iteration:d}"
+                )
 
     results = dict()
     results["success"] = success
@@ -646,7 +749,7 @@ def jax_precondition_u_kn(u_kn, N_k, f_k):
     return u_kn
 
 
-def precondition_u_kn(u_kn, N_k, f_k):
+def precondition_u_kn(u_kn, N_k, f_k, bits=default_bits):
     """Subtract a sample-dependent constant from u_kn to improve precision
 
     Parameters
@@ -657,6 +760,8 @@ def precondition_u_kn(u_kn, N_k, f_k):
         The number of samples in each state
     f_k : np.ndarray, shape=(n_states), dtype='float'
         The reduced free energies of each state
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -671,7 +776,7 @@ def precondition_u_kn(u_kn, N_k, f_k):
     x_n such that the current objective function value is zero, which
     should give maximum precision in the objective function.
     """
-    return jax_precondition_u_kn(u_kn, N_k, f_k)
+    return jited_call_attempt_bits(jax_precondition_u_kn, u_kn, N_k, f_k, bits=bits)
 
 
 def solve_mbar_once(
@@ -682,6 +787,7 @@ def solve_mbar_once(
     tol=1e-12,
     continuation=None,
     options=None,
+    bits=default_bits
 ):
     """Solve MBAR self-consistent equations using some form of equation solver.
 
@@ -704,6 +810,8 @@ def solve_mbar_once(
     options: dict, optional, default=None
         Optional dictionary of algorithm-specific parameters.  See
         scipy.optimize.root or scipy.optimize.minimize for details.
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -729,7 +837,7 @@ def solve_mbar_once(
     u_kn_nonzero, N_k_nonzeo, f_k_nonzero = validate_inputs(u_kn_nonzero, N_k_nonzero, f_k_nonzero)
     f_k_nonzero = f_k_nonzero - f_k_nonzero[0]  # Work with reduced dimensions with f_k[0] := 0
     N_k_nonzero = 1.0 * N_k_nonzero  # convert to float for acceleration.
-    u_kn_nonzero = precondition_u_kn(u_kn_nonzero, N_k_nonzero, f_k_nonzero)
+    u_kn_nonzero = precondition_u_kn(u_kn_nonzero, N_k_nonzero, f_k_nonzero, bits=bits)
 
     pad = lambda x: np.pad(
         x, (1, 0), mode="constant"
@@ -740,25 +848,25 @@ def solve_mbar_once(
     )  # Helper function drops first element of gradient
 
     # Create objective functions / nonlinear equations to send to scipy.optimize, fixing f_0 = 0
-    grad = lambda x: mbar_gradient(u_kn_nonzero, N_k_nonzero, pad(x))[
+    grad = lambda x: mbar_gradient(u_kn_nonzero, N_k_nonzero, pad(x), bits=bits)[
         1:
     ]  # Objective function gradient
 
     grad_and_obj = lambda x: unpad_second_arg(
-        *mbar_objective_and_gradient(u_kn_nonzero, N_k_nonzero, pad(x))
+        *mbar_objective_and_gradient(u_kn_nonzero, N_k_nonzero, pad(x), bits=bits)
     )  # Objective function gradient and objective function
 
     de_jax_grad_and_obj = lambda x: (
         *map(np.array, grad_and_obj(x)),  # (...,) Casts to tuple instead of <map> object
     )  # Force any jax-based array output to normal numpy for scipy.optimize.minimize. np.asarray does not work.
 
-    hess = lambda x: mbar_hessian(u_kn_nonzero, N_k_nonzero, pad(x))[1:][
+    hess = lambda x: mbar_hessian(u_kn_nonzero, N_k_nonzero, pad(x), bits=bits)[1:][
         :, 1:
     ]  # Hessian of objective function
     with warnings.catch_warnings(record=True) as w:
         if use_jit and method == "BFGS":
             fpad = lambda x: npad(x, (1, 0))
-            obj = lambda x: mbar_objective(u_kn_nonzero, N_k_nonzero, fpad(x))
+            obj = lambda x: mbar_objective(u_kn_nonzero, N_k_nonzero, fpad(x), bits=bits)
             # objective function to be minimized (for derivative free methods, mostly jit)
             jax_results = optimize_maybe_jax.minimize(
                 obj,
@@ -785,7 +893,7 @@ def solve_mbar_once(
             )
             f_k_nonzero = pad(results["x"])
         elif method == "adaptive":
-            results = adaptive(u_kn_nonzero, N_k_nonzero, f_k_nonzero, tol=tol, options=options)
+            results = adaptive(u_kn_nonzero, N_k_nonzero, f_k_nonzero, tol=tol, options=options, bits=bits)
             f_k_nonzero = results["x"]
         elif method in scipy_root_options:
             # find the root in the gradient.
@@ -813,7 +921,7 @@ def solve_mbar_once(
             can_ignore = False  # If any warning is not just unknown options, can not skip check
         if not can_ignore:
             # Ensure MBAR solved correctly
-            w_nk_check = mbar_W_nk(u_kn_nonzero, N_k_nonzero, f_k_nonzero)
+            w_nk_check = mbar_W_nk(u_kn_nonzero, N_k_nonzero, f_k_nonzero, bits=bits)
             check_w_normalized(w_nk_check, N_k_nonzero)
             logger.warning(
                 "MBAR weights converged within tolerance, despite the SciPy Warnings. Please validate your results."
@@ -822,7 +930,7 @@ def solve_mbar_once(
     return f_k_nonzero, results
 
 
-def solve_mbar(u_kn_nonzero, N_k_nonzero, f_k_nonzero, solver_protocol=None):
+def solve_mbar(u_kn_nonzero, N_k_nonzero, f_k_nonzero, solver_protocol=None, bits=default_bits):
     """Solve MBAR self-consistent equations using some sequence of equation solvers.
 
     Parameters
@@ -837,6 +945,8 @@ def solve_mbar(u_kn_nonzero, N_k_nonzero, f_k_nonzero, solver_protocol=None):
     solver_protocol : tuple(dict()), optional, default=None
         Optional list of dictionaries of steps in solver protocol.
         If None, a default protocol will be used.
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -871,7 +981,7 @@ def solve_mbar(u_kn_nonzero, N_k_nonzero, f_k_nonzero, solver_protocol=None):
 
     for solver in solver_protocol:
         f_k_nonzero_result, results = solve_mbar_once(
-            u_kn_nonzero, N_k_nonzero, f_k_nonzero, **solver
+            u_kn_nonzero, N_k_nonzero, f_k_nonzero, bits=bits, **solver
         )
         all_fks.append(f_k_nonzero_result)
         all_gnorms.append(
@@ -913,7 +1023,7 @@ def solve_mbar(u_kn_nonzero, N_k_nonzero, f_k_nonzero, solver_protocol=None):
     return f_k_nonzero_result, all_results
 
 
-def solve_mbar_for_all_states(u_kn, N_k, f_k, states_with_samples, solver_protocol):
+def solve_mbar_for_all_states(u_kn, N_k, f_k, states_with_samples, solver_protocol, bits=default_bits):
     """Solve for free energies of states with samples, then calculate for
     empty states.
 
@@ -928,6 +1038,8 @@ def solve_mbar_for_all_states(u_kn, N_k, f_k, states_with_samples, solver_protoc
     solver_protocol : tuple(dict()), optional, default=None
         Sequence of dictionaries of steps in solver protocol for final
         stage of refinement.
+    bits: int, str, or BitSizeTracker, optional
+        Set the default bitsize
 
     Returns
     -------
@@ -943,6 +1055,7 @@ def solve_mbar_for_all_states(u_kn, N_k, f_k, states_with_samples, solver_protoc
             N_k[states_with_samples],
             f_k[states_with_samples],
             solver_protocol=solver_protocol,
+            bits=bits,
         )
 
     f_k[states_with_samples] = np.array(f_k_nonzero)

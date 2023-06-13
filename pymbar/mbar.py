@@ -49,6 +49,7 @@ from pymbar.utils import (
     DataError,
     logsumexp,
     check_w_normalized,
+    BitSizeTracker,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class MBAR:
         n_bootstraps=0,
         bootstrap_solver_protocol=None,
         rseed=None,
+        bitsize=BitSizeTracker.DEFAULT_BITS
     ):
         """Initialize multistate Bennett acceptance ratio (MBAR) on a set of simulation data.
 
@@ -186,6 +188,11 @@ class MBAR:
             We usually just do steps of adaptive sampling without. "robust" would be the backup.
             Default: dict(method="adaptive", options=dict(min_sc_iter=0)),
 
+        bitsize: int, optional, default=64
+            Set the bitsize for data and arrays. We HIGHLY recommend keeping the default 64-bit arrays.
+            This also sets the JAX settings (if present) which may cause issues since JAX operates in 32-bit
+            mode by default.
+
         Notes
         -----
         The reduced potential energy ``u_kn[k,n] = u_k(x_{ln})``, where the reduced potential energy ``u_l(x)`` is
@@ -225,9 +232,11 @@ class MBAR:
 
         """
 
+        self._bits = BitSizeTracker(bitsize)
+
         # Store local copies of necessary data.
         # N_k[k] is the number of samples from state k, some of which might be zero.
-        self.N_k = np.array(N_k, dtype=np.int64)
+        self.N_k = np.array(N_k, dtype=self._bits.npint)
         self.N = np.sum(self.N_k)
 
         # Get dimensions of reduced potential energy matrix, and convert to KxN form if needed.
@@ -236,7 +245,7 @@ class MBAR:
             u_kn = kln_to_kn(u_kn, N_k=self.N_k)
 
         # u_kn[k,n] is the reduced potential energy of sample n evaluated at state k
-        self.u_kn = np.array(u_kn, dtype=np.float64)
+        self.u_kn = np.array(u_kn, dtype=self._bits.npfloat)
 
         K, N = np.shape(u_kn)
 
@@ -257,7 +266,7 @@ class MBAR:
         if x_kindices is not None:
             self.x_kindices = x_kindices
         else:
-            self.x_kindices = np.arange(N, dtype=np.int64)
+            self.x_kindices = np.arange(N, dtype=self._bits.npint)
             Nsum = 0
             for k in range(K):
                 self.x_kindices[Nsum : Nsum + self.N_k[k]] = k
@@ -325,7 +334,7 @@ class MBAR:
         # Initialize estimate of relative dimensionless free energy of each state to zero.
         # Note that f_k[0] will be constrained to be zero throughout.
         # this is default
-        self.f_k = np.zeros([self.K], dtype=np.float64)
+        self.f_k = np.zeros([self.K], dtype=self._bits.npfloat)
 
         # If an initial guess of the relative dimensionless free energies is
         # specified, start with that.
@@ -333,14 +342,14 @@ class MBAR:
             if self.verbose:
                 logger.info("Initializing f_k with provided initial guess.")
             # Cast to np array.
-            initial_f_k = np.array(initial_f_k, dtype=np.float64)
+            initial_f_k = np.array(initial_f_k, dtype=self._bits.npfloat)
             # Check shape
             if initial_f_k.shape != self.f_k.shape:
                 raise ParameterError(
                     "initial_f_k must be a {:d}-dimensional np array.".format(self.K)
                 )
             # Initialize f_k with provided guess.
-            self.f_k = initial_f_k
+            self.f_k = initial_f_k.astype(self._bits.npfloat)
             if self.verbose:
                 logger.info(self.f_k)
             # Shift all free energies such that f_0 = 0.
@@ -408,14 +417,14 @@ class MBAR:
             np.random.seed(rseed)
 
         self.f_k = mbar_solvers.solve_mbar_for_all_states(
-            self.u_kn, self.N_k, self.f_k, self.states_with_samples, solver_protocol
+            self.u_kn, self.N_k, self.f_k, self.states_with_samples, solver_protocol, bits=self._bits
         )
 
         if n_bootstraps > 0:
             self.n_bootstraps = n_bootstraps
             maxfrac = int(max((1, 0.1 * self.n_bootstraps)))
 
-            self.f_k_boots = np.zeros([self.n_bootstraps, self.K])
+            self.f_k_boots = np.zeros([self.n_bootstraps, self.K], dtype=self._bits.npfloat)
             allN = int(np.sum(N_k))
             self.bootstrap_rints = np.zeros([self.n_bootstraps, allN], int)
             for b in range(self.n_bootstraps):
@@ -437,6 +446,7 @@ class MBAR:
                     f_k_init,
                     self.states_with_samples,
                     bootstrap_solver_protocol,
+                    bits=self._bits
                 )
                 # save the random integers for computing expectations.
                 self.bootstrap_rints[b, :] = rints
@@ -449,7 +459,7 @@ class MBAR:
 
         # bootstrapped weight matrices not generated here, but when expectations are needed
         # otherwise, it's too much memory to keep
-        self.Log_W_nk = mbar_solvers.mbar_log_W_nk(self.u_kn, self.N_k, self.f_k)
+        self.Log_W_nk = mbar_solvers.mbar_log_W_nk(self.u_kn, self.N_k, self.f_k, bits=self._bits)
 
         # Print final dimensionless free energies.
         if self.verbose:
@@ -473,6 +483,18 @@ class MBAR:
 
         """
         return np.exp(self.Log_W_nk)
+
+    @property
+    def bitsize(self):
+        """
+        Fetch the bitsize for calculations
+
+        Returns
+        -------
+        bitsize : int
+        """
+
+        return self._bits.bitsize
 
     # =========================================================================
     def weights(self):
@@ -862,7 +884,7 @@ class MBAR:
         NL = len(L_list)  # number of states we need to examine
         if S > 0:
             A_list = np.unique(state_map[1, :])  # what are the unique observables
-            A_min = np.zeros([len(A_list)], dtype=np.float64)
+            A_min = np.zeros([len(A_list)], dtype=self._bits.npfloat)
         else:
             A_list = np.zeros(0, dtype=int)
 
@@ -880,14 +902,14 @@ class MBAR:
         # log weight matrix
         msize = K + NL + S  # augmented size; all of the states needed to calculate
         # the observables, and the observables themselves.
-        Log_W_nk = np.zeros([N, msize], np.float64)  # log weight matrix
-        N_k = np.zeros([msize], np.int64)  # counts
-        f_k = np.zeros([msize], np.float64)  # free energies
+        Log_W_nk = np.zeros([N, msize], self._bits.npfloat)  # log weight matrix
+        N_k = np.zeros([msize], self._bits.npint)  # counts
+        f_k = np.zeros([msize], self._bits.npfloat)  # free energies
 
         if uncertainty_method == "bootstrap":
             n_total = self.n_bootstraps + 1
-            A_i_bootstrap = np.zeros([self.n_bootstraps, S])
-            f_bootstrap = np.zeros([self.n_bootstraps, len(state_list)])
+            A_i_bootstrap = np.zeros([self.n_bootstraps, S], self._bits.npfloat)
+            f_bootstrap = np.zeros([self.n_bootstraps, len(state_list)], self._bits.npfloat)
         else:
             n_total = 1
 
@@ -904,7 +926,7 @@ class MBAR:
                 f_k[0:K] = self.f_k_boots[n - 1, :]
                 ri = self.bootstrap_rints[n - 1]
                 u_kn = self.u_kn[:, ri]
-                Log_W_nk[:, 0:K] = mbar_solvers.mbar_log_W_nk(u_kn, self.N_k, f_k[0:K])
+                Log_W_nk[:, 0:K] = mbar_solvers.mbar_log_W_nk(u_kn, self.N_k, f_k[0:K], bits=self._bits)
             # Pre-calculate the log denominator: Eqns 13, 14 in MBAR paper
 
             states_with_samples = self.N_k > 0
@@ -937,7 +959,7 @@ class MBAR:
                 Log_W_nk[:, sa] += f_k[sa]  # normalize this row
 
             # Compute estimates of A_i[s]
-            A_i = np.zeros([S], np.float64)
+            A_i = np.zeros([S], self._bits.npfloat)
             for s in range(S):
                 A_i[s] = np.exp(-f_k[K + NL + s])
 
@@ -1202,6 +1224,7 @@ class MBAR:
             )
 
         dims = len(np.shape(A_n))
+        A_n = A_n.astype(self._bits.npfloat)
 
         if dims > 2:
             logger.warning(
@@ -1377,7 +1400,7 @@ class MBAR:
 
         if len(np.shape(A_in)) == 3:
             A_in_old = A_in.copy()  # convert to k by n format
-            A_in = np.zeros([I, N], np.float64)
+            A_in = np.zeros([I, N], self._bits.npfloat)
             for i in range(I):
                 A_in[i, :] = kn_to_n(A_in_old[i, :, :], N_k=self.N_k)
 
@@ -1401,8 +1424,8 @@ class MBAR:
         if (
             (compute_uncertainty or compute_covariance) and compute_uncertainty != "bootstrap"
         ) or return_theta:
-            Adiag = np.zeros([2 * I, 2 * I], dtype=np.float64)
-            diag = np.ones(2 * I, dtype=np.float64)
+            Adiag = np.zeros([2 * I, 2 * I], dtype=self._bits.npfloat)
+            diag = np.ones(2 * I, dtype=self._bits.npfloat)
             diag[0:I] = diag[I : 2 * I] = inner_results["observables"] - inner_results["Amin"]
             np.fill_diagonal(Adiag, diag)
             Theta = Adiag @ inner_results["Theta"] @ Adiag  # matrix multiplication
@@ -1568,6 +1591,8 @@ class MBAR:
 
         if u_kn is None:
             u_kn = self.u_kn
+
+        u_kn = u_kn.astype(self._bits.npfloat)
 
         # Retrieve N and K for convenience.
         K, N = np.shape(u_kn)
@@ -1806,7 +1831,7 @@ class MBAR:
 
             # Construct matrices
             Ndiag = np.diag(N_k)
-            I = np.identity(K, dtype=np.float64)
+            I = np.identity(K, dtype=self._bits.npfloat)
 
             # Compute SVD of W
             # False Avoids O(N^2) memory allocation by only calculting the active subspace of U.
@@ -1826,7 +1851,7 @@ class MBAR:
 
             # Construct matrices
             Ndiag = np.diag(N_k)
-            I = np.identity(K, dtype=np.float64)
+            I = np.identity(K, dtype=self._bits.npfloat)
 
             # Compute singular values and right singular vectors of W without using SVD
             # Instead, we compute eigenvalues and eigenvectors of W'W.
@@ -1929,7 +1954,7 @@ class MBAR:
         initialization_order = np.where(self.N_k > 0)[0]
         # Initialize all f_k to zero.
         if f_k_init is None:
-            f_k_init = np.zeros(len(self.f_k))
+            f_k_init = np.zeros(len(self.f_k), dtype=self._bits.npfloat)
 
         starting_f_k_init = f_k_init.copy()
         for index in range(0, np.size(initialization_order) - 1):
